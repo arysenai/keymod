@@ -72,6 +72,8 @@ mod host_stubs {
 use std::sync::Mutex;
 static VAULT: Mutex<Option<secrets::SecretVault>> = Mutex::new(None);
 static POLICY_ENGINE: Mutex<Option<policy::PolicyEngine>> = Mutex::new(None);
+static BACKEND_CONFIG: Mutex<Option<types::BackendConfig>> = Mutex::new(None);
+static MANDATE_INFO: Mutex<Option<types::MandateInfo>> = Mutex::new(None);
 
 fn with_vault<F, R>(f: F) -> R
 where
@@ -93,7 +95,7 @@ where
                 spending: types::SpendingPolicy {
                     max_per_tx: 0,
                     max_daily: 0,
-                    max_monthly: 0,
+                    expires_at: None,
                 },
                 secrets: std::collections::HashMap::new(),
             },
@@ -344,7 +346,7 @@ mod tests {
             spending: types::SpendingPolicy {
                 max_per_tx: 1000,
                 max_daily: 5000,
-                max_monthly: 50000,
+                expires_at: None,
             },
             secrets: HashMap::new(),
         };
@@ -359,7 +361,7 @@ mod tests {
             spending: types::SpendingPolicy {
                 max_per_tx: 1000,
                 max_daily: 5000,
-                max_monthly: 50000,
+                expires_at: None,
             },
             secrets: HashMap::new(),
         };
@@ -404,7 +406,7 @@ mod tests {
             spending: types::SpendingPolicy {
                 max_per_tx: 100_000_000,
                 max_daily: 500_000_000,
-                max_monthly: 5_000_000_000,
+                expires_at: None,
             },
             secrets: {
                 let mut m = HashMap::new();
@@ -470,7 +472,7 @@ mod tests {
             spending: types::SpendingPolicy {
                 max_per_tx: 100_000_000,
                 max_daily: 500_000_000,
-                max_monthly: 5_000_000_000,
+                expires_at: None,
             },
             secrets: {
                 let mut m = HashMap::new();
@@ -502,7 +504,7 @@ mod tests {
             spending: types::SpendingPolicy {
                 max_per_tx: 100_000_000,
                 max_daily: 500_000_000,
-                max_monthly: 5_000_000_000,
+                expires_at: None,
             },
             secrets: HashMap::new(),
         };
@@ -512,7 +514,7 @@ mod tests {
             engine.record_spending(20_000_000);
             let summary = engine.get_spending_summary();
             assert_eq!(summary.today, 30_000_000);
-            assert_eq!(summary.this_month, 30_000_000);
+
             assert_eq!(summary.total_all_time, 30_000_000);
         });
     }

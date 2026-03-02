@@ -75,7 +75,7 @@ fn policy_serialization_roundtrip() {
         spending: SpendingPolicy {
             max_per_tx: 100_000_000,
             max_daily: 500_000_000,
-            max_monthly: 5_000_000_000,
+            expires_at: None,
         },
         secrets: {
             let mut m = HashMap::new();
@@ -140,7 +140,7 @@ fn test_policy() -> Policy {
         spending: SpendingPolicy {
             max_per_tx: 100_000_000,
             max_daily: 500_000_000,
-            max_monthly: 5_000_000_000,
+            expires_at: None,
         },
         secrets,
     }
@@ -149,13 +149,13 @@ fn test_policy() -> Policy {
 #[test]
 fn policy_allow_spending_within_limits() {
     let engine = PolicyEngine::new(test_policy(), 1000);
-    assert!(engine.check_spending(50_000_000).is_ok());
+    assert!(engine.check_spending(50_000_000, 1000).is_ok());
 }
 
 #[test]
 fn policy_deny_spending_over_per_tx() {
     let engine = PolicyEngine::new(test_policy(), 1000);
-    let result = engine.check_spending(200_000_000);
+    let result = engine.check_spending(200_000_000, 1000);
     assert!(result.is_err());
     assert!(result.unwrap_err().contains("max_per_tx"));
 }
@@ -165,10 +165,10 @@ fn policy_deny_spending_over_daily() {
     let mut engine = PolicyEngine::new(test_policy(), 1000);
     engine.record_spending(400_000_000);
     // 100 more = 500 total = exactly the limit
-    assert!(engine.check_spending(100_000_000).is_ok());
+    assert!(engine.check_spending(100_000_000, 1000).is_ok());
     engine.record_spending(100_000_000);
     // Any more should be denied
-    assert!(engine.check_spending(1_000_000).is_err());
+    assert!(engine.check_spending(1_000_000, 1000).is_err());
 }
 
 #[test]
@@ -178,7 +178,20 @@ fn policy_daily_limit_resets() {
     // Advance past one day
     engine.reset_if_needed(1000 + 86_400);
     // Should be able to spend again
-    assert!(engine.check_spending(100_000_000).is_ok());
+    assert!(engine.check_spending(100_000_000, 1000 + 86_400).is_ok());
+}
+
+#[test]
+fn policy_deny_spending_when_expired() {
+    let mut policy = test_policy();
+    policy.spending.expires_at = Some(2000);
+    let engine = PolicyEngine::new(policy, 1000);
+    // Before expiry
+    assert!(engine.check_spending(50_000_000, 1500).is_ok());
+    // After expiry
+    let result = engine.check_spending(50_000_000, 2001);
+    assert!(result.is_err());
+    assert!(result.unwrap_err().contains("expired"));
 }
 
 #[test]
@@ -237,7 +250,6 @@ fn policy_spending_summary() {
     engine.record_spending(20_000_000);
     let summary = engine.get_spending_summary();
     assert_eq!(summary.today, 30_000_000);
-    assert_eq!(summary.this_month, 30_000_000);
     assert_eq!(summary.total_all_time, 30_000_000);
 }
 
@@ -371,7 +383,7 @@ fn end_to_end_with_mock_http() {
         spending: SpendingPolicy {
             max_per_tx: 100_000_000,
             max_daily: 500_000_000,
-            max_monthly: 5_000_000_000,
+            expires_at: None,
         },
         secrets: {
             let mut m = HashMap::new();
@@ -443,7 +455,7 @@ fn end_to_end_domain_denied() {
         spending: SpendingPolicy {
             max_per_tx: 100_000_000,
             max_daily: 500_000_000,
-            max_monthly: 5_000_000_000,
+            expires_at: None,
         },
         secrets: {
             let mut m = HashMap::new();
@@ -469,12 +481,10 @@ fn end_to_end_domain_denied() {
 fn spending_summary_serialization() {
     let summary = SpendingSummary {
         today: 10_000_000,
-        this_month: 50_000_000,
         total_all_time: 200_000_000,
     };
     let json = serde_json::to_string(&summary).unwrap();
     let parsed: SpendingSummary = serde_json::from_str(&json).unwrap();
     assert_eq!(parsed.today, 10_000_000);
-    assert_eq!(parsed.this_month, 50_000_000);
     assert_eq!(parsed.total_all_time, 200_000_000);
 }

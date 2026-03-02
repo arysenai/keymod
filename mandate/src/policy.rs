@@ -31,16 +31,13 @@ impl SecretUsage {
 pub struct PolicyEngine {
     policy: Policy,
     spending_today: u64,
-    spending_this_month: u64,
     total_all_time: u64,
     last_day_reset: u64,
-    last_month_reset: u64,
     secret_usage: HashMap<String, SecretUsage>,
 }
 
 const SECONDS_PER_MINUTE: u64 = 60;
 const SECONDS_PER_DAY: u64 = 86_400;
-const SECONDS_PER_MONTH: u64 = 30 * SECONDS_PER_DAY;
 
 impl PolicyEngine {
     /// Create a new PolicyEngine with the given policy and current timestamp.
@@ -48,10 +45,8 @@ impl PolicyEngine {
         Self {
             policy,
             spending_today: 0,
-            spending_this_month: 0,
             total_all_time: 0,
             last_day_reset: now,
-            last_month_reset: now,
             secret_usage: HashMap::new(),
         }
     }
@@ -74,12 +69,6 @@ impl PolicyEngine {
             self.last_day_reset = now;
         }
 
-        // Reset monthly spending if a month has passed
-        if now >= self.last_month_reset + SECONDS_PER_MONTH {
-            self.spending_this_month = 0;
-            self.last_month_reset = now;
-        }
-
         // Reset per-secret counters
         for usage in self.secret_usage.values_mut() {
             if now >= usage.last_minute_reset + SECONDS_PER_MINUTE {
@@ -93,9 +82,19 @@ impl PolicyEngine {
         }
     }
 
-    /// Check if a spending amount is within policy limits.
+    /// Check if a spending amount is within policy limits (local pre-flight).
     /// Does NOT record the spending; call `record_spending` separately on success.
-    pub fn check_spending(&self, amount: u64) -> Result<(), String> {
+    pub fn check_spending(&self, amount: u64, now: u64) -> Result<(), String> {
+        // Check mandate expiry (fast pre-flight rejection)
+        if let Some(expires_at) = self.policy.spending.expires_at {
+            if now > expires_at {
+                return Err(format!(
+                    "mandate expired at {} (current time: {})",
+                    expires_at, now
+                ));
+            }
+        }
+
         if amount > self.policy.spending.max_per_tx {
             return Err(format!(
                 "amount {} exceeds max_per_tx {}",
@@ -110,20 +109,12 @@ impl PolicyEngine {
             ));
         }
 
-        if self.spending_this_month + amount > self.policy.spending.max_monthly {
-            return Err(format!(
-                "amount {} would exceed monthly limit {} (already spent {})",
-                amount, self.policy.spending.max_monthly, self.spending_this_month
-            ));
-        }
-
         Ok(())
     }
 
     /// Record a spending amount (add to rolling totals).
     pub fn record_spending(&mut self, amount: u64) {
         self.spending_today += amount;
-        self.spending_this_month += amount;
         self.total_all_time += amount;
     }
 
@@ -182,7 +173,6 @@ impl PolicyEngine {
     pub fn get_spending_summary(&self) -> SpendingSummary {
         SpendingSummary {
             today: self.spending_today,
-            this_month: self.spending_this_month,
             total_all_time: self.total_all_time,
         }
     }
@@ -268,9 +258,9 @@ mod tests {
         );
         Policy {
             spending: SpendingPolicy {
-                max_per_tx: 100_000_000,    // 100 USDC
-                max_daily: 500_000_000,     // 500 USDC
-                max_monthly: 5_000_000_000, // 5000 USDC
+                max_per_tx: 100_000_000, // 100 USDC
+                max_daily: 500_000_000,  // 500 USDC
+                expires_at: None,
             },
             secrets,
         }
@@ -279,13 +269,13 @@ mod tests {
     #[test]
     fn allow_spending_within_limits() {
         let engine = PolicyEngine::new(test_policy(), 1000);
-        assert!(engine.check_spending(50_000_000).is_ok()); // 50 USDC
+        assert!(engine.check_spending(50_000_000, 1000).is_ok()); // 50 USDC
     }
 
     #[test]
     fn deny_spending_over_per_tx() {
         let engine = PolicyEngine::new(test_policy(), 1000);
-        assert!(engine.check_spending(200_000_000).is_err()); // 200 USDC > 100 max
+        assert!(engine.check_spending(200_000_000, 1000).is_err()); // 200 USDC > 100 max
     }
 
     #[test]
@@ -294,9 +284,9 @@ mod tests {
         // Spend 400 USDC (within per-tx and daily)
         engine.record_spending(400_000_000);
         // Now 200 more would exceed daily 500
-        assert!(engine.check_spending(100_000_000).is_ok()); // 500 total = ok
+        assert!(engine.check_spending(100_000_000, 1000).is_ok()); // 500 total = ok
         engine.record_spending(100_000_000);
-        assert!(engine.check_spending(1_000_000).is_err()); // 501 total = denied
+        assert!(engine.check_spending(1_000_000, 1000).is_err()); // 501 total = denied
     }
 
     #[test]
@@ -305,7 +295,25 @@ mod tests {
         engine.record_spending(400_000_000);
         // Advance time by a full day
         engine.reset_if_needed(1000 + SECONDS_PER_DAY);
-        assert!(engine.check_spending(100_000_000).is_ok()); // reset, so ok
+        assert!(engine.check_spending(100_000_000, 1000 + SECONDS_PER_DAY).is_ok());
+    }
+
+    #[test]
+    fn deny_spending_when_expired() {
+        let mut policy = test_policy();
+        policy.spending.expires_at = Some(2000);
+        let engine = PolicyEngine::new(policy, 1000);
+        // Before expiry — ok
+        assert!(engine.check_spending(50_000_000, 1500).is_ok());
+        // After expiry — denied
+        assert!(engine.check_spending(50_000_000, 2001).is_err());
+    }
+
+    #[test]
+    fn allow_spending_when_no_expiry() {
+        let engine = PolicyEngine::new(test_policy(), 1000);
+        // Far future — no expiry set, should be fine
+        assert!(engine.check_spending(50_000_000, 999_999_999).is_ok());
     }
 
     #[test]
@@ -352,7 +360,6 @@ mod tests {
         engine.record_spending(20_000_000);
         let summary = engine.get_spending_summary();
         assert_eq!(summary.today, 30_000_000);
-        assert_eq!(summary.this_month, 30_000_000);
         assert_eq!(summary.total_all_time, 30_000_000);
     }
 
