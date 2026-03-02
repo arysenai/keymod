@@ -79,6 +79,16 @@ pub struct BackendConfig {
     pub session_key_id: String,
 }
 
+/// Extended config for mandate_init — includes worker private key.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InitConfig {
+    pub base_url: String,
+    pub agent_id: String,
+    pub worker_key_id: String,
+    pub session_key_id: String,
+    pub worker_private_key_hex: String,
+}
+
 /// Mandate info returned by GET /mandates/mine.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MandateInfo {

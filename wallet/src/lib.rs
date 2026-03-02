@@ -120,6 +120,22 @@ pub fn generate_worker_keypair() -> JsValue {
     serde_wasm_bindgen::to_value(&val).unwrap_or(JsValue::NULL)
 }
 
+/// Generate an Ed25519 worker keypair and return the private key.
+/// Returns `{ pub_key: hex, key_id: string, private_key: hex }`.
+/// Used internally by the SDK to pass the key to the mandate module.
+#[wasm_bindgen]
+pub fn generate_worker_keypair_with_secret() -> JsValue {
+    let (pub_bytes, priv_bytes) = ed25519::generate_keypair_raw();
+    let key_id = ed25519::derive_key_id(&pub_bytes);
+    store_private_key(&key_id, &priv_bytes);
+    let val = json!({
+        "pub_key": hex::encode(&pub_bytes),
+        "key_id": key_id,
+        "private_key": hex::encode(&priv_bytes),
+    });
+    serde_wasm_bindgen::to_value(&val).unwrap_or(JsValue::NULL)
+}
+
 /// Generate a secp256k1 session keypair.
 /// Returns `{ pub_key: hex, key_id: string }`.
 #[wasm_bindgen]
@@ -128,6 +144,21 @@ pub fn generate_session_keypair() -> JsValue {
     let val = json!({
         "pub_key": hex::encode(&pub_bytes),
         "key_id": key_id,
+    });
+    serde_wasm_bindgen::to_value(&val).unwrap_or(JsValue::NULL)
+}
+
+/// Generate a secp256k1 session keypair and return the private key.
+/// Returns `{ pub_key: hex, key_id: string, private_key: hex }`.
+#[wasm_bindgen]
+pub fn generate_session_keypair_with_secret() -> JsValue {
+    let (pub_bytes, priv_bytes) = secp256k1::generate_keypair_raw();
+    let key_id = secp256k1::derive_key_id(&pub_bytes);
+    store_private_key(&key_id, &priv_bytes);
+    let val = json!({
+        "pub_key": hex::encode(&pub_bytes),
+        "key_id": key_id,
+        "private_key": hex::encode(&priv_bytes),
     });
     serde_wasm_bindgen::to_value(&val).unwrap_or(JsValue::NULL)
 }

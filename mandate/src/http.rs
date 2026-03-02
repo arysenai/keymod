@@ -80,10 +80,26 @@ fn execute_wasm(template: &RequestTemplate) -> HttpResponse {
 
 /// Mock HTTP execution for native tests.
 ///
-/// Returns a canned 200 response that includes the request URL in the body,
-/// making it possible to verify the request was constructed correctly.
+/// Checks MOCK_RESPONSES for a URL match first, then falls back to
+/// a canned 200 echo response.
 #[cfg(not(target_arch = "wasm32"))]
 fn execute_mock(template: &RequestTemplate) -> HttpResponse {
+    // Check configurable mock responses first (URL substring match)
+    let mock_match = MOCK_RESPONSES.with(|m| {
+        let map = m.borrow();
+        for (pattern, response) in map.iter() {
+            if template.url.contains(pattern) {
+                return Some(response.clone());
+            }
+        }
+        None
+    });
+
+    if let Some(response) = mock_match {
+        return response;
+    }
+
+    // Default: echo response
     let body = serde_json::json!({
         "mock": true,
         "echo": {
@@ -103,6 +119,32 @@ fn execute_mock(template: &RequestTemplate) -> HttpResponse {
         },
         body: serde_json::to_string(&body).unwrap_or_default(),
     }
+}
+
+// ---------------------------------------------------------------------------
+// Configurable mock responses for testing
+// ---------------------------------------------------------------------------
+
+#[cfg(not(target_arch = "wasm32"))]
+use std::cell::RefCell;
+
+#[cfg(not(target_arch = "wasm32"))]
+thread_local! {
+    static MOCK_RESPONSES: RefCell<HashMap<String, HttpResponse>> = RefCell::new(HashMap::new());
+}
+
+/// Register a mock response for any request whose URL contains `url_pattern`.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn set_mock_response(url_pattern: &str, response: HttpResponse) {
+    MOCK_RESPONSES.with(|m| {
+        m.borrow_mut().insert(url_pattern.to_string(), response);
+    });
+}
+
+/// Clear all configured mock responses.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn clear_mock_responses() {
+    MOCK_RESPONSES.with(|m| m.borrow_mut().clear());
 }
 
 /// Execute a raw HTTP request (lower-level API).
