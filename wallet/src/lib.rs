@@ -4,6 +4,8 @@ pub mod storage;
 pub mod types;
 
 use serde_json::json;
+use std::collections::HashMap;
+use std::sync::Mutex;
 use wasm_bindgen::prelude::*;
 
 // ---------------------------------------------------------------------------
@@ -54,6 +56,55 @@ mod host_stubs {
 }
 
 // ---------------------------------------------------------------------------
+// In-memory key store — holds private keys for the lifetime of the WASM instance
+// ---------------------------------------------------------------------------
+
+static KEY_STORE: Mutex<Option<HashMap<String, Vec<u8>>>> = Mutex::new(None);
+
+fn store_private_key(key_id: &str, private_key: &[u8]) {
+    let mut guard = KEY_STORE.lock().unwrap_or_else(|e| e.into_inner());
+    let store = guard.get_or_insert_with(HashMap::new);
+    store.insert(key_id.to_string(), private_key.to_vec());
+}
+
+fn load_private_key(key_id: &str) -> Option<Vec<u8>> {
+    let guard = KEY_STORE.lock().unwrap_or_else(|e| e.into_inner());
+    guard.as_ref()?.get(key_id).cloned()
+}
+
+// ---------------------------------------------------------------------------
+// Internal functions (testable without wasm_bindgen)
+// ---------------------------------------------------------------------------
+
+/// Generate an Ed25519 worker keypair and store the private key.
+fn generate_worker_internal() -> (Vec<u8>, String) {
+    let (pub_bytes, priv_bytes) = ed25519::generate_keypair_raw();
+    let key_id = ed25519::derive_key_id(&pub_bytes);
+    store_private_key(&key_id, &priv_bytes);
+    (pub_bytes.to_vec(), key_id)
+}
+
+/// Generate a secp256k1 session keypair and store the private key.
+fn generate_session_internal() -> (Vec<u8>, String) {
+    let (pub_bytes, priv_bytes) = secp256k1::generate_keypair_raw();
+    let key_id = secp256k1::derive_key_id(&pub_bytes);
+    store_private_key(&key_id, &priv_bytes);
+    (pub_bytes, key_id)
+}
+
+/// Sign with Ed25519 worker key from the key store.
+fn sign_worker_internal(message: &[u8], key_id: &str) -> Option<Vec<u8>> {
+    let priv_key = load_private_key(key_id)?;
+    Some(ed25519::sign_raw(message, &priv_key).0)
+}
+
+/// Sign with secp256k1 session key from the key store.
+fn sign_session_internal(message: &[u8], key_id: &str) -> Option<Vec<u8>> {
+    let priv_key = load_private_key(key_id)?;
+    Some(secp256k1::sign_raw(message, &priv_key).0)
+}
+
+// ---------------------------------------------------------------------------
 // wasm-bindgen exports
 // ---------------------------------------------------------------------------
 
@@ -61,10 +112,10 @@ mod host_stubs {
 /// Returns `{ pub_key: hex, key_id: string }`.
 #[wasm_bindgen]
 pub fn generate_worker_keypair() -> JsValue {
-    let kp = ed25519::generate_keypair();
+    let (pub_bytes, key_id) = generate_worker_internal();
     let val = json!({
-        "pub_key": hex::encode(&kp.pub_key),
-        "key_id": kp.key_id,
+        "pub_key": hex::encode(&pub_bytes),
+        "key_id": key_id,
     });
     serde_wasm_bindgen::to_value(&val).unwrap_or(JsValue::NULL)
 }
@@ -73,24 +124,26 @@ pub fn generate_worker_keypair() -> JsValue {
 /// Returns `{ pub_key: hex, key_id: string }`.
 #[wasm_bindgen]
 pub fn generate_session_keypair() -> JsValue {
-    let kp = secp256k1::generate_keypair();
+    let (pub_bytes, key_id) = generate_session_internal();
     let val = json!({
-        "pub_key": hex::encode(&kp.pub_key),
-        "key_id": kp.key_id,
+        "pub_key": hex::encode(&pub_bytes),
+        "key_id": key_id,
     });
     serde_wasm_bindgen::to_value(&val).unwrap_or(JsValue::NULL)
 }
 
 /// Sign a message with the worker (Ed25519) key.
+/// Returns the real signature if the key is in the store, zeros otherwise.
 #[wasm_bindgen]
 pub fn sign_worker(message: &[u8], key_id: &str) -> Vec<u8> {
-    ed25519::sign(message, key_id).0
+    sign_worker_internal(message, key_id).unwrap_or_else(|| vec![0u8; 64])
 }
 
 /// Sign a message with the session (secp256k1) key.
+/// Returns the real signature if the key is in the store, zeros otherwise.
 #[wasm_bindgen]
 pub fn sign_session(message: &[u8], key_id: &str) -> Vec<u8> {
-    secp256k1::sign(message, key_id).0
+    sign_session_internal(message, key_id).unwrap_or_else(|| vec![0u8; 65])
 }
 
 /// Verify an Ed25519 signature.
@@ -252,6 +305,36 @@ mod tests {
         let secp_sig = secp256k1::sign_raw(message, &secp_priv);
         // secp256k1 signature (65 bytes) should not verify as Ed25519
         assert!(!ed25519::verify(message, &secp_sig.0, &ed_pub));
+    }
+
+    // --- Key store roundtrip tests ---
+
+    #[test]
+    fn worker_sign_verify_via_keystore() {
+        let (pub_bytes, key_id) = generate_worker_internal();
+        let message = b"hello from key store";
+        let sig = sign_worker_internal(message, &key_id).expect("key should be in store");
+        assert_eq!(sig.len(), 64);
+        assert!(ed25519::verify(message, &sig, &pub_bytes));
+        // Wrong message fails
+        assert!(!ed25519::verify(b"wrong", &sig, &pub_bytes));
+    }
+
+    #[test]
+    fn session_sign_verify_via_keystore() {
+        let (pub_bytes, key_id) = generate_session_internal();
+        let message = b"hello from key store";
+        let sig = sign_session_internal(message, &key_id).expect("key should be in store");
+        assert_eq!(sig.len(), 65);
+        assert!(secp256k1::verify(message, &sig, &pub_bytes));
+        // Wrong message fails
+        assert!(!secp256k1::verify(b"wrong", &sig, &pub_bytes));
+    }
+
+    #[test]
+    fn sign_with_unknown_key_returns_none() {
+        assert!(sign_worker_internal(b"test", "nonexistent_key_id").is_none());
+        assert!(sign_session_internal(b"test", "nonexistent_key_id").is_none());
     }
 
     // --- Legacy tests (kept for backwards compatibility) ---
