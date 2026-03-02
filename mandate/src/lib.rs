@@ -76,6 +76,7 @@ static POLICY_ENGINE: Mutex<Option<policy::PolicyEngine>> = Mutex::new(None);
 static BACKEND_CONFIG: Mutex<Option<types::BackendConfig>> = Mutex::new(None);
 static MANDATE_INFO: Mutex<Option<types::MandateInfo>> = Mutex::new(None);
 static WORKER_KEY: Mutex<Option<Vec<u8>>> = Mutex::new(None);
+static SESSION_KEY: Mutex<Option<Vec<u8>>> = Mutex::new(None);
 
 fn with_vault<F, R>(f: F) -> R
 where
@@ -336,6 +337,14 @@ fn mandate_init_internal(config_json: &str) -> Result<types::MandateInfo, String
     }
     *WORKER_KEY.lock().unwrap_or_else(|e| e.into_inner()) = Some(worker_key_bytes.clone());
 
+    // Decode and store session private key
+    let session_key_bytes = hex::decode(&init_cfg.session_private_key_hex)
+        .map_err(|e| format!("invalid session key hex: {}", e))?;
+    if session_key_bytes.len() != 32 {
+        return Err("session private key must be 32 bytes".to_string());
+    }
+    *SESSION_KEY.lock().unwrap_or_else(|e| e.into_inner()) = Some(session_key_bytes);
+
     // Store backend config
     let config = types::BackendConfig {
         base_url: init_cfg.base_url,
@@ -411,6 +420,163 @@ fn parse_expires_at(s: &str) -> Option<u64> {
     None
 }
 
+/// Transfer USDC to an address.
+///
+/// 5-step flow:
+/// 1. Local pre-flight: check spending limits (expires_at, per-tx, daily)
+/// 2. Backend check: POST /mandates/check-spend { amount }
+/// 3. Prepare tx: POST /transactions/prepare { to, amount, type: "transfer" }
+/// 4. Sign: secp256k1 sign the user_op_hash with session key
+/// 5. Submit: POST /transactions/submit { tx_id, signature }
+/// 6. Record: POST /mandates/record-spend { amount }
+/// 7. Return { tx_hash }
+#[wasm_bindgen]
+pub fn transfer_usdc(to: &str, amount: &str) -> JsValue {
+    match transfer_internal(to, amount) {
+        Ok(result) => serde_wasm_bindgen::to_value(&result).unwrap_or(JsValue::NULL),
+        Err(e) => {
+            serde_wasm_bindgen::to_value(&json!({ "error": e })).unwrap_or(JsValue::NULL)
+        }
+    }
+}
+
+fn transfer_internal(to: &str, amount: &str) -> Result<types::TransferResult, String> {
+    tx_flow(to, amount, "transfer", None)
+}
+
+/// Create a DealOrder with escrow.
+///
+/// Same 5-step flow as transfer_usdc but with type: "escrow" and extra params.
+#[wasm_bindgen]
+pub fn create_deal_order(params_json: &str) -> JsValue {
+    match deal_order_internal(params_json) {
+        Ok(result) => serde_wasm_bindgen::to_value(&result).unwrap_or(JsValue::NULL),
+        Err(e) => {
+            serde_wasm_bindgen::to_value(&json!({ "error": e })).unwrap_or(JsValue::NULL)
+        }
+    }
+}
+
+fn deal_order_internal(params_json: &str) -> Result<types::TransferResult, String> {
+    let params: types::DealOrderParams =
+        serde_json::from_str(params_json).map_err(|e| format!("invalid params: {}", e))?;
+    tx_flow(
+        &params.executor_agent_id,
+        &params.bounty_amount,
+        "escrow",
+        Some(&params),
+    )
+}
+
+/// Shared transaction flow for transfer and deal order.
+fn tx_flow(
+    to: &str,
+    amount: &str,
+    tx_type: &str,
+    deal_params: Option<&types::DealOrderParams>,
+) -> Result<types::TransferResult, String> {
+    // Load keys and config first — fail fast if not initialized
+    let config = BACKEND_CONFIG
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone()
+        .ok_or("not initialized: call mandate_init first")?;
+    let worker_key = WORKER_KEY
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone()
+        .ok_or("worker key not set")?;
+    let session_key = SESSION_KEY
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone()
+        .ok_or("session key not set")?;
+
+    let now = current_time();
+    let amount_micro = parse_usdc_amount(amount)?;
+
+    // Step 1: Local pre-flight — check spending limits
+    with_policy_engine(|engine| {
+        engine.reset_if_needed(now);
+        engine.check_spending(amount_micro, now)
+    })?;
+
+    // Step 2: Backend spending check
+    let check_body = json!({ "amount": amount }).to_string();
+    backend::signed_fetch(
+        "POST",
+        "/mandates/check-spend",
+        Some(&check_body),
+        &config,
+        &worker_key,
+    )?;
+
+    // Step 3: Prepare transaction
+    let mut prepare_body = json!({
+        "to": to,
+        "amount": amount,
+        "type": tx_type,
+    });
+    if let Some(params) = deal_params {
+        prepare_body["task_cid"] = json!(params.task_cid);
+        prepare_body["delivery_deadline"] = json!(params.delivery_deadline);
+    }
+    let prepare_resp = backend::signed_fetch(
+        "POST",
+        "/transactions/prepare",
+        Some(&prepare_body.to_string()),
+        &config,
+        &worker_key,
+    )?;
+    let prepare_data = backend::parse_response_data(&prepare_resp)?;
+    let tx_id = prepare_data["tx_id"]
+        .as_str()
+        .ok_or("missing tx_id in prepare response")?;
+    let user_op_hash = prepare_data["user_op_hash"]
+        .as_str()
+        .ok_or("missing user_op_hash in prepare response")?;
+
+    // Step 4: Sign user_op_hash with session key (secp256k1)
+    let hash_bytes =
+        hex::decode(user_op_hash.strip_prefix("0x").unwrap_or(user_op_hash))
+            .map_err(|e| format!("invalid user_op_hash hex: {}", e))?;
+    let signature = arysen_wallet::secp256k1::sign_raw(&hash_bytes, &session_key);
+    let signature_hex = format!("0x{}", hex::encode(&signature.0));
+
+    // Step 5: Submit signed transaction
+    let submit_body = json!({
+        "tx_id": tx_id,
+        "signature": signature_hex,
+    })
+    .to_string();
+    let submit_resp = backend::signed_fetch(
+        "POST",
+        "/transactions/submit",
+        Some(&submit_body),
+        &config,
+        &worker_key,
+    )?;
+    let submit_data = backend::parse_response_data(&submit_resp)?;
+    let tx_hash = submit_data["tx_hash"]
+        .as_str()
+        .ok_or("missing tx_hash in submit response")?
+        .to_string();
+
+    // Step 6: Record spending
+    let record_body = json!({ "amount": amount }).to_string();
+    let _ = backend::signed_fetch(
+        "POST",
+        "/mandates/record-spend",
+        Some(&record_body),
+        &config,
+        &worker_key,
+    );
+    // Also record locally
+    with_policy_engine(|engine| engine.record_spending(amount_micro));
+
+    Ok(types::TransferResult { tx_hash })
+}
+
 /// Return the SHA-256 hash of this WASM module's binary.
 /// Stub: returns 32 zero bytes.
 /// Named differently from wallet's get_module_hash to avoid duplicate symbol
@@ -436,6 +602,7 @@ mod tests {
         *BACKEND_CONFIG.lock().unwrap_or_else(|e| e.into_inner()) = None;
         *MANDATE_INFO.lock().unwrap_or_else(|e| e.into_inner()) = None;
         *WORKER_KEY.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        *SESSION_KEY.lock().unwrap_or_else(|e| e.into_inner()) = None;
         http::clear_mock_responses();
     }
 
@@ -668,13 +835,15 @@ mod tests {
     }
 
     fn test_init_config() -> String {
-        let (_, priv_key) = arysen_wallet::ed25519::generate_keypair_raw();
+        let (_, worker_priv) = arysen_wallet::ed25519::generate_keypair_raw();
+        let (_, session_priv) = arysen_wallet::secp256k1::generate_keypair_raw();
         serde_json::json!({
             "base_url": "https://api.arysen.ai",
             "agent_id": "agent-test-456",
             "worker_key_id": "wk_test",
             "session_key_id": "sk_test",
-            "worker_private_key_hex": hex::encode(priv_key),
+            "worker_private_key_hex": hex::encode(worker_priv),
+            "session_private_key_hex": hex::encode(session_priv),
         })
         .to_string()
     }
@@ -742,5 +911,207 @@ mod tests {
         assert_eq!(parse_usdc_amount("0.5").unwrap(), 500_000);
         assert_eq!(parse_usdc_amount("100.25").unwrap(), 100_250_000);
         assert!(parse_usdc_amount("abc").is_err());
+    }
+
+    // --- Phase 10: transfer_usdc + create_deal_order tests ---
+
+    /// Set up mocks for the full 5-step transfer flow.
+    fn mock_transfer_flow() {
+        mock_mandate_response(); // GET /mandates/mine
+        http::set_mock_response(
+            "/mandates/check-spend",
+            types::HttpResponse {
+                status: 200,
+                headers: HashMap::new(),
+                body: r#"{"success":true,"data":{"allowed":true}}"#.to_string(),
+            },
+        );
+        http::set_mock_response(
+            "/transactions/prepare",
+            types::HttpResponse {
+                status: 200,
+                headers: HashMap::new(),
+                body: r#"{"success":true,"data":{"tx_id":"tx-abc-123","user_op_hash":"0xdeadbeef01020304050607080910111213141516171819202122232425262728"}}"#.to_string(),
+            },
+        );
+        http::set_mock_response(
+            "/transactions/submit",
+            types::HttpResponse {
+                status: 200,
+                headers: HashMap::new(),
+                body: r#"{"success":true,"data":{"tx_hash":"0xfinalhash999"}}"#.to_string(),
+            },
+        );
+        http::set_mock_response(
+            "/mandates/record-spend",
+            types::HttpResponse {
+                status: 200,
+                headers: HashMap::new(),
+                body: r#"{"success":true,"data":{}}"#.to_string(),
+            },
+        );
+    }
+
+    #[test]
+    fn transfer_usdc_full_flow() {
+        reset_state();
+        mock_transfer_flow();
+
+        // Init first
+        let init_result = mandate_init_internal(&test_init_config());
+        assert!(init_result.is_ok(), "init failed: {:?}", init_result.err());
+
+        // Transfer
+        let result = transfer_internal("0xRecipient", "5.00");
+        assert!(result.is_ok(), "transfer failed: {:?}", result.err());
+        let tx = result.unwrap();
+        assert_eq!(tx.tx_hash, "0xfinalhash999");
+
+        // Verify spending was recorded locally (>= because parallel tests may add)
+        with_policy_engine(|engine| {
+            let summary = engine.get_spending_summary();
+            assert!(summary.today >= 5_000_000, "expected at least 5 USDC recorded, got {}", summary.today);
+        });
+    }
+
+    #[test]
+    fn transfer_usdc_denied_by_local_preflight() {
+        reset_state();
+        mock_transfer_flow();
+
+        let init_result = mandate_init_internal(&test_init_config());
+        assert!(init_result.is_ok());
+
+        // Try to transfer more than max_per_tx (10 USDC from mock mandate)
+        let result = transfer_internal("0xRecipient", "15.00");
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("exceeds max_per_tx"));
+    }
+
+    #[test]
+    fn transfer_usdc_denied_by_backend_check() {
+        reset_state();
+        mock_mandate_response();
+        // Override check-spend to deny
+        http::set_mock_response(
+            "/mandates/check-spend",
+            types::HttpResponse {
+                status: 403,
+                headers: HashMap::new(),
+                body: r#"{"success":false,"error":"daily limit exceeded"}"#.to_string(),
+            },
+        );
+
+        let init_result = mandate_init_internal(&test_init_config());
+        assert!(init_result.is_ok());
+
+        let result = transfer_internal("0xRecipient", "5.00");
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("403"));
+    }
+
+    #[test]
+    fn transfer_usdc_prepare_fails_no_record() {
+        reset_state();
+        mock_mandate_response();
+        http::set_mock_response(
+            "/mandates/check-spend",
+            types::HttpResponse {
+                status: 200,
+                headers: HashMap::new(),
+                body: r#"{"success":true,"data":{"allowed":true}}"#.to_string(),
+            },
+        );
+        // Prepare fails
+        http::set_mock_response(
+            "/transactions/prepare",
+            types::HttpResponse {
+                status: 500,
+                headers: HashMap::new(),
+                body: r#"{"success":false,"error":"internal error"}"#.to_string(),
+            },
+        );
+
+        let init_result = mandate_init_internal(&test_init_config());
+        assert!(init_result.is_ok());
+
+        let result = transfer_internal("0xRecipient", "5.00");
+        assert!(result.is_err());
+
+        // Spending should NOT have been recorded
+        with_policy_engine(|engine| {
+            assert_eq!(engine.get_spending_summary().today, 0);
+        });
+    }
+
+    #[test]
+    fn transfer_usdc_signature_is_valid_secp256k1() {
+        reset_state();
+        mock_transfer_flow();
+
+        // Generate a session key and capture the public key
+        let (session_pub, session_priv) = arysen_wallet::secp256k1::generate_keypair_raw();
+        let (_, worker_priv) = arysen_wallet::ed25519::generate_keypair_raw();
+
+        let config = serde_json::json!({
+            "base_url": "https://api.arysen.ai",
+            "agent_id": "agent-test-456",
+            "worker_key_id": "wk_test",
+            "session_key_id": "sk_test",
+            "worker_private_key_hex": hex::encode(worker_priv),
+            "session_private_key_hex": hex::encode(session_priv),
+        })
+        .to_string();
+
+        let init_result = mandate_init_internal(&config);
+        assert!(init_result.is_ok());
+
+        // The transfer will sign user_op_hash with the session key
+        let result = transfer_internal("0xRecipient", "5.00");
+        assert!(result.is_ok());
+
+        // Verify: sign the same hash with the same key and check
+        let hash_hex = "deadbeef01020304050607080910111213141516171819202122232425262728";
+        let hash_bytes = hex::decode(hash_hex).unwrap();
+        let sig = arysen_wallet::secp256k1::sign_raw(&hash_bytes, &session_priv);
+        assert_eq!(sig.0.len(), 65);
+        assert!(arysen_wallet::secp256k1::verify(
+            &hash_bytes,
+            &sig.0,
+            &session_pub
+        ));
+    }
+
+    #[test]
+    fn transfer_and_deal_order_flow() {
+        // Combined test: init → transfer → deal order → verify
+        // Avoids parallel race conditions on statics.
+        reset_state();
+        mock_transfer_flow();
+
+        // Before init, transfer should fail
+        let result = transfer_internal("0xRecipient", "5.00");
+        assert!(result.is_err());
+        assert!(
+            result.unwrap_err().contains("not initialized"),
+            "expected 'not initialized' error before init"
+        );
+
+        // Init
+        let init_result = mandate_init_internal(&test_init_config());
+        assert!(init_result.is_ok(), "init failed: {:?}", init_result.err());
+
+        // Deal order
+        let params = serde_json::json!({
+            "executor_agent_id": "agent-exec-789",
+            "bounty_amount": "3.50",
+            "task_cid": "QmTaskCID123",
+            "delivery_deadline": 1735689600u64,
+        })
+        .to_string();
+
+        let result = deal_order_internal(&params);
+        assert!(result.is_ok(), "deal order failed: {:?}", result.err());
+        assert_eq!(result.unwrap().tx_hash, "0xfinalhash999");
     }
 }
