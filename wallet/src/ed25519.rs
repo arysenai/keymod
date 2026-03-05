@@ -59,7 +59,7 @@ pub fn verify(message: &[u8], signature: &[u8], pub_key: &[u8]) -> bool {
 }
 
 /// Derive a key_id from a public key: hex(sha256(pub_key))[:16].
-pub(crate) fn derive_key_id(pub_key: &[u8]) -> String {
+pub fn derive_key_id(pub_key: &[u8]) -> String {
     let hash = Sha256::digest(pub_key);
     hex::encode(&hash)[..16].to_string()
 }

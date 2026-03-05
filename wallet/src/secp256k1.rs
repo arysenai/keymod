@@ -1,8 +1,12 @@
 /// secp256k1 ECDSA signing and verification using k256.
+///
+/// Uses keccak256 for message hashing (EVM-compatible).
+/// Recovery ID uses EVM convention: v = 27 or 28.
 
 use crate::types::{KeyPair, Signature};
 use k256::ecdsa::{self, SigningKey, VerifyingKey};
 use sha2::{Digest, Sha256};
+use sha3::Keccak256;
 
 /// Generate a secp256k1 keypair.
 /// Returns (compressed_public_key [33], private_key [32]).
@@ -32,21 +36,37 @@ pub fn generate_keypair() -> KeyPair {
 }
 
 /// Sign a message using raw private key bytes.
-/// The message is SHA-256 hashed first, then signed with ECDSA.
-/// Returns a 65-byte signature: [r(32) | s(32) | recovery_id(1)].
+/// The message is keccak256-hashed first, then signed with ECDSA.
+/// Returns a 65-byte EVM-compatible signature: [r(32) | s(32) | v(1)].
+/// v = 27 or 28 (EVM convention).
 pub fn sign_raw(message: &[u8], private_key: &[u8]) -> Signature {
     let secret: [u8; 32] = private_key.try_into().expect("secp256k1 private key must be 32 bytes");
     let signing_key = SigningKey::from_bytes((&secret).into()).expect("invalid secp256k1 key");
 
-    // SHA-256 hash the message
-    let digest = Sha256::digest(message);
+    let digest = Keccak256::digest(message);
 
     let (sig, recovery_id): (ecdsa::Signature, _) = signing_key
         .sign_prehash_recoverable(&digest)
         .expect("signing failed");
 
     let mut sig_bytes = sig.to_bytes().to_vec(); // 64 bytes (r || s)
-    sig_bytes.push(recovery_id.to_byte()); // append recovery id
+    sig_bytes.push(recovery_id.to_byte() + 27); // EVM recovery id: 27 or 28
+    Signature(sig_bytes)
+}
+
+/// Sign a pre-hashed 32-byte digest directly (no additional hashing).
+/// Use this when the message is already a hash (e.g., ERC-4337 userOpHash).
+/// Returns a 65-byte EVM-compatible signature: [r(32) | s(32) | v(1)].
+pub fn sign_prehash(digest: &[u8; 32], private_key: &[u8]) -> Signature {
+    let secret: [u8; 32] = private_key.try_into().expect("secp256k1 private key must be 32 bytes");
+    let signing_key = SigningKey::from_bytes((&secret).into()).expect("invalid secp256k1 key");
+
+    let (sig, recovery_id): (ecdsa::Signature, _) = signing_key
+        .sign_prehash_recoverable(digest)
+        .expect("signing failed");
+
+    let mut sig_bytes = sig.to_bytes().to_vec();
+    sig_bytes.push(recovery_id.to_byte() + 27);
     Signature(sig_bytes)
 }
 
@@ -59,7 +79,7 @@ pub fn sign(message: &[u8], _key_id: &str) -> Signature {
 
 /// Verify a secp256k1 ECDSA signature.
 /// Accepts 64-byte (r||s) or 65-byte (r||s||v) signatures.
-/// The message is SHA-256 hashed before verification.
+/// The message is keccak256-hashed before verification.
 pub fn verify(message: &[u8], signature: &[u8], pub_key: &[u8]) -> bool {
     if signature.len() < 64 || pub_key.len() != 33 {
         return false;
@@ -75,15 +95,14 @@ pub fn verify(message: &[u8], signature: &[u8], pub_key: &[u8]) -> bool {
         return false;
     };
 
-    // SHA-256 hash the message (same as sign)
-    let digest = Sha256::digest(message);
+    let digest = Keccak256::digest(message);
 
     use k256::ecdsa::signature::hazmat::PrehashVerifier;
     verifying_key.verify_prehash(&digest, &sig).is_ok()
 }
 
 /// Derive a key_id from a public key: hex(sha256(pub_key))[:16].
-pub(crate) fn derive_key_id(pub_key: &[u8]) -> String {
+pub fn derive_key_id(pub_key: &[u8]) -> String {
     let hash = Sha256::digest(pub_key);
     hex::encode(&hash)[..16].to_string()
 }

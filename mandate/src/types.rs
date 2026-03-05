@@ -80,13 +80,16 @@ pub struct BackendConfig {
 }
 
 /// Extended config for mandate_init — includes worker + session private keys.
+/// Private key fields are optional when using mandate_generate_keys() first.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InitConfig {
     pub base_url: String,
     pub agent_id: String,
     pub worker_key_id: String,
     pub session_key_id: String,
+    #[serde(default)]
     pub worker_private_key_hex: String,
+    #[serde(default)]
     pub session_private_key_hex: String,
 }
 

@@ -297,6 +297,39 @@ pub fn get_spending_summary() -> JsValue {
     serde_wasm_bindgen::to_value(&summary).unwrap_or(JsValue::NULL)
 }
 
+/// Generate both keypairs (Ed25519 worker + secp256k1 session) inside WASM.
+///
+/// Private keys are stored internally in the mandate module's static state
+/// and never cross the WASM→JS boundary. Returns only public keys and key IDs.
+///
+/// Returns JSON:
+/// ```json
+/// {
+///   "worker_pub_key": "hex",
+///   "worker_key_id": "hex_id",
+///   "session_pub_key": "hex",
+///   "session_key_id": "hex_id"
+/// }
+/// ```
+#[wasm_bindgen]
+pub fn mandate_generate_keys() -> JsValue {
+    let (worker_pub, worker_priv) = arysen_wallet::ed25519::generate_keypair_raw();
+    let worker_key_id = arysen_wallet::ed25519::derive_key_id(&worker_pub);
+    *WORKER_KEY.lock().unwrap_or_else(|e| e.into_inner()) = Some(worker_priv.to_vec());
+
+    let (session_pub, session_priv) = arysen_wallet::secp256k1::generate_keypair_raw();
+    let session_key_id = arysen_wallet::secp256k1::derive_key_id(&session_pub);
+    *SESSION_KEY.lock().unwrap_or_else(|e| e.into_inner()) = Some(session_priv.to_vec());
+
+    let result = json!({
+        "worker_pub_key": hex::encode(&worker_pub),
+        "worker_key_id": worker_key_id,
+        "session_pub_key": hex::encode(&session_pub),
+        "session_key_id": session_key_id,
+    });
+    serde_wasm_bindgen::to_value(&result).unwrap_or(JsValue::NULL)
+}
+
 /// Initialize the mandate module with backend configuration.
 ///
 /// Parses the config JSON, stores the worker key for signing,
@@ -329,21 +362,28 @@ fn mandate_init_internal(config_json: &str) -> Result<types::MandateInfo, String
     let init_cfg: types::InitConfig =
         serde_json::from_str(config_json).map_err(|e| format!("invalid config: {}", e))?;
 
-    // Decode and store worker private key
-    let worker_key_bytes = hex::decode(&init_cfg.worker_private_key_hex)
-        .map_err(|e| format!("invalid worker key hex: {}", e))?;
-    if worker_key_bytes.len() != 32 {
-        return Err("worker private key must be 32 bytes".to_string());
-    }
-    *WORKER_KEY.lock().unwrap_or_else(|e| e.into_inner()) = Some(worker_key_bytes.clone());
+    // If keys were already generated via mandate_generate_keys(), use those.
+    // Otherwise, decode from the config (backward compat with _with_secret flow).
+    let has_worker = WORKER_KEY.lock().unwrap_or_else(|e| e.into_inner()).is_some();
+    let has_session = SESSION_KEY.lock().unwrap_or_else(|e| e.into_inner()).is_some();
 
-    // Decode and store session private key
-    let session_key_bytes = hex::decode(&init_cfg.session_private_key_hex)
-        .map_err(|e| format!("invalid session key hex: {}", e))?;
-    if session_key_bytes.len() != 32 {
-        return Err("session private key must be 32 bytes".to_string());
+    if !has_worker {
+        let worker_key_bytes = hex::decode(&init_cfg.worker_private_key_hex)
+            .map_err(|e| format!("invalid worker key hex: {}", e))?;
+        if worker_key_bytes.len() != 32 {
+            return Err("worker private key must be 32 bytes".to_string());
+        }
+        *WORKER_KEY.lock().unwrap_or_else(|e| e.into_inner()) = Some(worker_key_bytes);
     }
-    *SESSION_KEY.lock().unwrap_or_else(|e| e.into_inner()) = Some(session_key_bytes);
+
+    if !has_session {
+        let session_key_bytes = hex::decode(&init_cfg.session_private_key_hex)
+            .map_err(|e| format!("invalid session key hex: {}", e))?;
+        if session_key_bytes.len() != 32 {
+            return Err("session private key must be 32 bytes".to_string());
+        }
+        *SESSION_KEY.lock().unwrap_or_else(|e| e.into_inner()) = Some(session_key_bytes);
+    }
 
     // Store backend config
     let config = types::BackendConfig {
@@ -355,8 +395,13 @@ fn mandate_init_internal(config_json: &str) -> Result<types::MandateInfo, String
     *BACKEND_CONFIG.lock().unwrap_or_else(|e| e.into_inner()) = Some(config.clone());
 
     // Fetch mandate info from backend
+    let worker_key = WORKER_KEY
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone()
+        .ok_or("worker key not set")?;
     let response =
-        backend::signed_fetch("GET", "/mandates/mine", None, &config, &worker_key_bytes)?;
+        backend::signed_fetch("GET", "/mandates/mine", None, &config, &worker_key)?;
     let data = backend::parse_response_data(&response)?;
     let info: types::MandateInfo =
         serde_json::from_value(data).map_err(|e| format!("invalid mandate data: {}", e))?;
@@ -397,11 +442,43 @@ pub fn get_mandate_info() -> JsValue {
 }
 
 /// Parse a USDC string amount (e.g. "10.5") to u64 with 6 decimal places.
+/// Uses integer string parsing to avoid IEEE 754 float precision issues.
 fn parse_usdc_amount(s: &str) -> Result<u64, String> {
-    let f: f64 = s
-        .parse()
-        .map_err(|_| format!("invalid USDC amount: '{}'", s))?;
-    Ok((f * 1_000_000.0) as u64)
+    let s = s.trim();
+    if s.is_empty() {
+        return Err("invalid USDC amount: ''".to_string());
+    }
+
+    let (integer_part, decimal_part) = match s.split_once('.') {
+        Some((int_s, dec_s)) => (int_s, dec_s),
+        None => (s, ""),
+    };
+
+    let integer: u64 = if integer_part.is_empty() {
+        0
+    } else {
+        integer_part
+            .parse()
+            .map_err(|_| format!("invalid USDC amount: '{}'", s))?
+    };
+
+    // Pad or truncate decimal to exactly 6 digits
+    let decimal: u64 = if decimal_part.is_empty() {
+        0
+    } else {
+        let padded = if decimal_part.len() > 6 {
+            &decimal_part[..6]
+        } else {
+            decimal_part
+        };
+        let parsed: u64 = padded
+            .parse()
+            .map_err(|_| format!("invalid USDC amount: '{}'", s))?;
+        // Scale up: "5" → 500000, "25" → 250000, "123456" → 123456
+        parsed * 10u64.pow(6 - padded.len() as u32)
+    };
+
+    Ok(integer * 1_000_000 + decimal)
 }
 
 /// Parse an ISO date string or unix timestamp to Option<u64>.
@@ -537,10 +614,14 @@ fn tx_flow(
         .ok_or("missing user_op_hash in prepare response")?;
 
     // Step 4: Sign user_op_hash with session key (secp256k1)
+    // user_op_hash is already a 32-byte hash — use sign_prehash to avoid double-hashing
     let hash_bytes =
         hex::decode(user_op_hash.strip_prefix("0x").unwrap_or(user_op_hash))
             .map_err(|e| format!("invalid user_op_hash hex: {}", e))?;
-    let signature = arysen_wallet::secp256k1::sign_raw(&hash_bytes, &session_key);
+    let hash_array: [u8; 32] = hash_bytes
+        .try_into()
+        .map_err(|_| "user_op_hash must be 32 bytes")?;
+    let signature = arysen_wallet::secp256k1::sign_prehash(&hash_array, &session_key);
     let signature_hex = format!("0x{}", hex::encode(&signature.0));
 
     // Step 5: Submit signed transaction
