@@ -189,13 +189,6 @@ pub fn verify_session(message: &[u8], signature: &[u8], pub_key: &[u8]) -> bool 
     secp256k1::verify(message, signature, pub_key)
 }
 
-/// Return the SHA-256 hash of this WASM module's binary.
-/// Stub: returns 32 zero bytes.
-#[wasm_bindgen]
-pub fn get_module_hash() -> Vec<u8> {
-    vec![0u8; 32]
-}
-
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -384,8 +377,4 @@ mod tests {
         assert!(!kp.key_id.is_empty());
     }
 
-    #[test]
-    fn module_hash_is_32_bytes() {
-        assert_eq!(get_module_hash().len(), 32);
-    }
 }

@@ -90,7 +90,6 @@ Output in `wallet/pkg/` and `mandate/pkg/`.
 | `sign_session(message, key_id)` | secp256k1 signature (65 bytes) |
 | `verify_worker(message, sig, pub_key)` | Ed25519 verify |
 | `verify_session(message, sig, pub_key)` | secp256k1 verify |
-| `get_module_hash()` | SHA-256 of WASM binary |
 
 ### Mandate
 
@@ -107,7 +106,8 @@ Output in `wallet/pkg/` and `mandate/pkg/`.
 | `get_mandate_info()` | Cached mandate details |
 | `transfer_usdc(to, amount)` | USDC transfer (5-step flow) |
 | `create_deal_order(params_json)` | Escrowed deal order |
-| `get_mandate_hash()` | SHA-256 of WASM binary |
+
+> **Note:** WASM binary hashes are computed at load time by the agent-sdk (`computeWasmHash`), not inside WASM. See `agent-sdk/src/keymod/loader.ts`.
 
 ## Tests
 

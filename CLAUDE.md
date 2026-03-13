@@ -59,5 +59,5 @@ WASM output goes to `wallet/pkg/` and `mandate/pkg/`. These are linked by `agent
 
 - `pub(crate)` for internal cross-module functions (e.g., `derive_key_id`)
 - `wasm_bindgen` exports use snake_case matching Rust convention; the TS wrapper camelCases them
-- Mandate's `get_mandate_hash` is intentionally named differently from wallet's `get_module_hash` to avoid wasm_bindgen symbol collision when mandate statically links wallet
+- WASM binary hashes are computed at SDK load time by `agent-sdk/src/keymod/loader.ts` (`computeWasmHash`), not inside WASM — avoids the bootstrapping problem of self-hashing
 - USDC amounts: u64 with 6 decimal places (1 USDC = 1_000_000)

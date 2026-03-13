@@ -658,15 +658,6 @@ fn tx_flow(
     Ok(types::TransferResult { tx_hash })
 }
 
-/// Return the SHA-256 hash of this WASM module's binary.
-/// Stub: returns 32 zero bytes.
-/// Named differently from wallet's get_module_hash to avoid duplicate symbol
-/// when wallet is statically linked.
-#[wasm_bindgen]
-pub fn get_mandate_hash() -> Vec<u8> {
-    vec![0u8; 32]
-}
-
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -751,11 +742,6 @@ mod tests {
         };
         let response = inject::execute(&template);
         assert_eq!(response.status, 200);
-    }
-
-    #[test]
-    fn module_hash_is_32_bytes() {
-        assert_eq!(get_mandate_hash().len(), 32);
     }
 
     #[test]
