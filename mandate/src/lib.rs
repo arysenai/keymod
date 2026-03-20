@@ -15,46 +15,15 @@ use wasm_bindgen::prelude::*;
 #[cfg(target_arch = "wasm32")]
 #[link(wasm_import_module = "env")]
 extern "C" {
-    fn key_store_read(key_id: *const u8, key_id_len: u32, buf: *mut u8, buf_len: u32) -> i32;
-    fn key_store_write(key_id: *const u8, key_id_len: u32, data: *const u8, data_len: u32) -> i32;
-    fn get_random_bytes(buf: *mut u8, len: u32) -> i32;
     fn get_time() -> u64;
     fn http_execute(req: *const u8, req_len: u32, resp: *mut u8, resp_len: u32) -> i32;
 }
 
 // Native stubs for `cargo test` (not compiled into WASM)
+// Note: key_store_read, key_store_write, get_time stubs are provided by arysen-wallet crate.
+// Only mandate-specific stubs (http_execute, get_time) live here.
 #[cfg(not(target_arch = "wasm32"))]
 mod host_stubs {
-    #[no_mangle]
-    pub extern "C" fn key_store_read(
-        _key_id: *const u8,
-        _key_id_len: u32,
-        _buf: *mut u8,
-        _buf_len: u32,
-    ) -> i32 {
-        -1
-    }
-
-    #[no_mangle]
-    pub extern "C" fn key_store_write(
-        _key_id: *const u8,
-        _key_id_len: u32,
-        _data: *const u8,
-        _data_len: u32,
-    ) -> i32 {
-        0
-    }
-
-    #[no_mangle]
-    pub extern "C" fn get_random_bytes(_buf: *mut u8, _len: u32) -> i32 {
-        0
-    }
-
-    #[no_mangle]
-    pub extern "C" fn get_time() -> u64 {
-        0
-    }
-
     #[no_mangle]
     pub extern "C" fn http_execute(
         _req: *const u8,
@@ -313,12 +282,36 @@ pub fn get_spending_summary() -> JsValue {
 /// ```
 #[wasm_bindgen]
 pub fn mandate_generate_keys() -> JsValue {
+    match mandate_generate_keys_internal() {
+        Ok(val) => val,
+        Err(e) => {
+            serde_wasm_bindgen::to_value(&json!({ "error": e })).unwrap_or(JsValue::NULL)
+        }
+    }
+}
+
+fn mandate_generate_keys_internal() -> Result<JsValue, String> {
+    // Initialize master key for encrypted persistence
+    arysen_wallet::init_master_key()?;
+
     let (worker_pub, worker_priv) = arysen_wallet::ed25519::generate_keypair_raw();
     let worker_key_id = arysen_wallet::ed25519::derive_key_id(&worker_pub);
-    *WORKER_KEY.lock().unwrap_or_else(|e| e.into_inner()) = Some(worker_priv.to_vec());
 
     let (session_pub, session_priv) = arysen_wallet::secp256k1::generate_keypair_raw();
     let session_key_id = arysen_wallet::secp256k1::derive_key_id(&session_pub);
+
+    // Persist encrypted keys via host key store
+    arysen_wallet::persist_key(
+        &format!("arysen_worker:{}", worker_key_id),
+        &worker_priv,
+    )?;
+    arysen_wallet::persist_key(
+        &format!("arysen_session:{}", session_key_id),
+        &session_priv,
+    )?;
+
+    // Cache plaintext in statics for immediate use
+    *WORKER_KEY.lock().unwrap_or_else(|e| e.into_inner()) = Some(worker_priv.to_vec());
     *SESSION_KEY.lock().unwrap_or_else(|e| e.into_inner()) = Some(session_priv.to_vec());
 
     let result = json!({
@@ -327,7 +320,7 @@ pub fn mandate_generate_keys() -> JsValue {
         "session_pub_key": hex::encode(&session_pub),
         "session_key_id": session_key_id,
     });
-    serde_wasm_bindgen::to_value(&result).unwrap_or(JsValue::NULL)
+    Ok(serde_wasm_bindgen::to_value(&result).unwrap_or(JsValue::NULL))
 }
 
 /// Initialize the mandate module with backend configuration.
@@ -362,11 +355,26 @@ fn mandate_init_internal(config_json: &str) -> Result<types::MandateInfo, String
     let init_cfg: types::InitConfig =
         serde_json::from_str(config_json).map_err(|e| format!("invalid config: {}", e))?;
 
-    // If keys were already generated via mandate_generate_keys(), use those.
-    // Otherwise, decode from the config (backward compat with _with_secret flow).
+    // Key loading priority:
+    // 1. Already in statics (from mandate_generate_keys() in this session)
+    // 2. Load from persistent host key store (TEE/keychain/encrypted files)
+    // 3. Decode from config hex (legacy backward compat)
     let has_worker = WORKER_KEY.lock().unwrap_or_else(|e| e.into_inner()).is_some();
     let has_session = SESSION_KEY.lock().unwrap_or_else(|e| e.into_inner()).is_some();
 
+    if !has_worker {
+        // Try loading from persistent store first
+        let store_key_id = format!("arysen_worker:{}", init_cfg.worker_key_id);
+        if let Ok(()) = arysen_wallet::init_master_key() {
+            if let Ok(key_bytes) = arysen_wallet::load_key(&store_key_id) {
+                if key_bytes.len() == 32 {
+                    *WORKER_KEY.lock().unwrap_or_else(|e| e.into_inner()) = Some(key_bytes);
+                }
+            }
+        }
+    }
+    // Fall back to config hex if still not loaded
+    let has_worker = WORKER_KEY.lock().unwrap_or_else(|e| e.into_inner()).is_some();
     if !has_worker {
         let worker_key_bytes = hex::decode(&init_cfg.worker_private_key_hex)
             .map_err(|e| format!("invalid worker key hex: {}", e))?;
@@ -376,6 +384,19 @@ fn mandate_init_internal(config_json: &str) -> Result<types::MandateInfo, String
         *WORKER_KEY.lock().unwrap_or_else(|e| e.into_inner()) = Some(worker_key_bytes);
     }
 
+    if !has_session {
+        // Try loading from persistent store first
+        let store_key_id = format!("arysen_session:{}", init_cfg.session_key_id);
+        if let Ok(()) = arysen_wallet::init_master_key() {
+            if let Ok(key_bytes) = arysen_wallet::load_key(&store_key_id) {
+                if key_bytes.len() == 32 {
+                    *SESSION_KEY.lock().unwrap_or_else(|e| e.into_inner()) = Some(key_bytes);
+                }
+            }
+        }
+    }
+    // Fall back to config hex if still not loaded
+    let has_session = SESSION_KEY.lock().unwrap_or_else(|e| e.into_inner()).is_some();
     if !has_session {
         let session_key_bytes = hex::decode(&init_cfg.session_private_key_hex)
             .map_err(|e| format!("invalid session key hex: {}", e))?;
@@ -612,6 +633,34 @@ fn tx_flow(
     let user_op_hash = prepare_data["user_op_hash"]
         .as_str()
         .ok_or("missing user_op_hash in prepare response")?;
+
+    // Step 3.5: Validate calldata — verify `to` matches requested recipient
+    // This closes the gap where a compromised JS layer could redirect payments
+    // by tampering with the HTTP bridge response from /transactions/prepare.
+    // Only validates for direct transfers (to is a hex address). Escrow/deal orders
+    // use agent IDs as `to` and have different calldata formats.
+    let to_hex_clean = to.strip_prefix("0x").unwrap_or(to);
+    let is_hex_address = to_hex_clean.len() == 40 && hex::decode(to_hex_clean).is_ok();
+    if is_hex_address {
+        if let Some(calldata_hex) = prepare_data["calldata"].as_str() {
+            let calldata = hex::decode(calldata_hex.strip_prefix("0x").unwrap_or(calldata_hex))
+                .map_err(|e| format!("invalid calldata hex: {}", e))?;
+            // ABI layout: [4 selector][32 to_padded][32 token][32 amount][32 ref]
+            if calldata.len() < 4 + 32 {
+                return Err("calldata too short to contain to address".to_string());
+            }
+            // Address is right-aligned in the 32-byte ABI word: 12 zero bytes + 20 address bytes
+            let decoded_to = &calldata[4 + 12..4 + 32];
+            let requested_to = hex::decode(to_hex_clean).unwrap(); // already validated
+            if decoded_to != requested_to.as_slice() {
+                return Err(format!(
+                    "calldata to address mismatch: expected 0x{}, got 0x{}",
+                    hex::encode(&requested_to),
+                    hex::encode(decoded_to),
+                ));
+            }
+        }
+    }
 
     // Step 4: Sign user_op_hash with session key (secp256k1)
     // user_op_hash is already a 32-byte hash — use sign_prehash to avoid double-hashing
@@ -982,8 +1031,31 @@ mod tests {
 
     // --- Phase 10: transfer_usdc + create_deal_order tests ---
 
-    /// Set up mocks for the full 5-step transfer flow.
+    /// Test recipient address (20 bytes = 40 hex chars)
+    const TEST_RECIPIENT: &str = "0x1234567890abcdef1234567890abcdef12345678";
+
+    /// Build ABI-encoded calldata for transferWithFee(address to, address token, uint256 amount, bytes32 ref).
+    /// The `to` address is placed in the first 32-byte parameter word (right-aligned, 12 zero-pad + 20 address).
+    fn make_test_calldata(to_hex: &str) -> String {
+        let to_clean = to_hex.strip_prefix("0x").unwrap_or(to_hex);
+        let to_bytes = hex::decode(to_clean).unwrap();
+        assert_eq!(to_bytes.len(), 20, "address must be 20 bytes");
+        // 4-byte selector (arbitrary) + 32-byte to (12 zeros + 20 addr) + 32 token + 32 amount + 32 ref
+        let mut calldata = vec![0xab, 0xcd, 0xef, 0x01]; // selector
+        calldata.extend_from_slice(&[0u8; 12]); // padding
+        calldata.extend_from_slice(&to_bytes);   // to address
+        calldata.extend_from_slice(&[0u8; 32]);  // token (placeholder)
+        calldata.extend_from_slice(&[0u8; 32]);  // amount (placeholder)
+        calldata.extend_from_slice(&[0u8; 32]);  // ref (placeholder)
+        format!("0x{}", hex::encode(calldata))
+    }
+
+    /// Set up mocks for the full 5-step transfer flow with calldata validation.
     fn mock_transfer_flow() {
+        mock_transfer_flow_for(TEST_RECIPIENT);
+    }
+
+    fn mock_transfer_flow_for(recipient: &str) {
         mock_mandate_response(); // GET /mandates/mine
         http::set_mock_response(
             "/mandates/check-spend",
@@ -993,12 +1065,16 @@ mod tests {
                 body: r#"{"success":true,"data":{"allowed":true}}"#.to_string(),
             },
         );
+        let calldata = make_test_calldata(recipient);
         http::set_mock_response(
             "/transactions/prepare",
             types::HttpResponse {
                 status: 200,
                 headers: HashMap::new(),
-                body: r#"{"success":true,"data":{"tx_id":"tx-abc-123","user_op_hash":"0xdeadbeef01020304050607080910111213141516171819202122232425262728"}}"#.to_string(),
+                body: format!(
+                    r#"{{"success":true,"data":{{"tx_id":"tx-abc-123","user_op_hash":"0xdeadbeef01020304050607080910111213141516171819202122232425262728","calldata":"{}"}}}}"#,
+                    calldata
+                ),
             },
         );
         http::set_mock_response(
@@ -1029,7 +1105,7 @@ mod tests {
         assert!(init_result.is_ok(), "init failed: {:?}", init_result.err());
 
         // Transfer
-        let result = transfer_internal("0xRecipient", "5.00");
+        let result = transfer_internal(TEST_RECIPIENT, "5.00");
         assert!(result.is_ok(), "transfer failed: {:?}", result.err());
         let tx = result.unwrap();
         assert_eq!(tx.tx_hash, "0xfinalhash999");
@@ -1050,7 +1126,7 @@ mod tests {
         assert!(init_result.is_ok());
 
         // Try to transfer more than max_per_tx (10 USDC from mock mandate)
-        let result = transfer_internal("0xRecipient", "15.00");
+        let result = transfer_internal(TEST_RECIPIENT, "15.00");
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("exceeds max_per_tx"));
     }
@@ -1072,7 +1148,7 @@ mod tests {
         let init_result = mandate_init_internal(&test_init_config());
         assert!(init_result.is_ok());
 
-        let result = transfer_internal("0xRecipient", "5.00");
+        let result = transfer_internal(TEST_RECIPIENT, "5.00");
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("403"));
     }
@@ -1102,7 +1178,7 @@ mod tests {
         let init_result = mandate_init_internal(&test_init_config());
         assert!(init_result.is_ok());
 
-        let result = transfer_internal("0xRecipient", "5.00");
+        let result = transfer_internal(TEST_RECIPIENT, "5.00");
         assert!(result.is_err());
 
         // Spending should NOT have been recorded
@@ -1134,7 +1210,7 @@ mod tests {
         assert!(init_result.is_ok());
 
         // The transfer will sign user_op_hash with the session key
-        let result = transfer_internal("0xRecipient", "5.00");
+        let result = transfer_internal(TEST_RECIPIENT, "5.00");
         assert!(result.is_ok());
 
         // Verify: sign the same hash with the same key and check
@@ -1157,7 +1233,7 @@ mod tests {
         mock_transfer_flow();
 
         // Before init, transfer should fail
-        let result = transfer_internal("0xRecipient", "5.00");
+        let result = transfer_internal(TEST_RECIPIENT, "5.00");
         assert!(result.is_err());
         assert!(
             result.unwrap_err().contains("not initialized"),
@@ -1180,5 +1256,63 @@ mod tests {
         let result = deal_order_internal(&params);
         assert!(result.is_ok(), "deal order failed: {:?}", result.err());
         assert_eq!(result.unwrap().tx_hash, "0xfinalhash999");
+    }
+
+    // --- Calldata validation tests ---
+
+    #[test]
+    fn calldata_validation_passes_with_matching_to() {
+        reset_state();
+        mock_transfer_flow(); // calldata contains TEST_RECIPIENT
+        let init_result = mandate_init_internal(&test_init_config());
+        assert!(init_result.is_ok());
+
+        let result = transfer_internal(TEST_RECIPIENT, "5.00");
+        assert!(result.is_ok(), "transfer should pass with matching calldata: {:?}", result.err());
+    }
+
+    #[test]
+    fn calldata_validation_rejects_mismatched_to() {
+        reset_state();
+        // Mock with a DIFFERENT recipient in calldata
+        let attacker = "0xdeaddeaddeaddeaddeaddeaddeaddeaddeaddead";
+        mock_transfer_flow_for(attacker);
+        let init_result = mandate_init_internal(&test_init_config());
+        assert!(init_result.is_ok());
+
+        // Agent requests transfer to TEST_RECIPIENT but calldata has attacker address
+        let result = transfer_internal(TEST_RECIPIENT, "5.00");
+        assert!(result.is_err(), "transfer should be rejected on calldata mismatch");
+        let err = result.unwrap_err();
+        assert!(err.contains("calldata to address mismatch"), "error should mention mismatch: {}", err);
+    }
+
+    #[test]
+    fn calldata_validation_rejects_truncated_calldata() {
+        reset_state();
+        mock_mandate_response();
+        http::set_mock_response(
+            "/mandates/check-spend",
+            types::HttpResponse {
+                status: 200,
+                headers: HashMap::new(),
+                body: r#"{"success":true,"data":{"allowed":true}}"#.to_string(),
+            },
+        );
+        // Calldata too short — only 4 bytes (selector, no params)
+        http::set_mock_response(
+            "/transactions/prepare",
+            types::HttpResponse {
+                status: 200,
+                headers: HashMap::new(),
+                body: r#"{"success":true,"data":{"tx_id":"tx-abc-123","user_op_hash":"0xdeadbeef01020304050607080910111213141516171819202122232425262728","calldata":"0xabcdef01"}}"#.to_string(),
+            },
+        );
+        let init_result = mandate_init_internal(&test_init_config());
+        assert!(init_result.is_ok());
+
+        let result = transfer_internal(TEST_RECIPIENT, "5.00");
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("too short"));
     }
 }
