@@ -642,7 +642,10 @@ fn tx_flow(
     let to_hex_clean = to.strip_prefix("0x").unwrap_or(to);
     let is_hex_address = to_hex_clean.len() == 40 && hex::decode(to_hex_clean).is_ok();
     if is_hex_address {
-        if let Some(calldata_hex) = prepare_data["calldata"].as_str() {
+        let calldata_hex = prepare_data["calldata"]
+            .as_str()
+            .ok_or("calldata required for direct transfer but missing from prepare response")?;
+        {
             let calldata = hex::decode(calldata_hex.strip_prefix("0x").unwrap_or(calldata_hex))
                 .map_err(|e| format!("invalid calldata hex: {}", e))?;
             // ABI layout: [4 selector][32 to_padded][32 token][32 amount][32 ref]
