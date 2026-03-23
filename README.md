@@ -43,9 +43,9 @@ curl https://rustwasm.github.io/wasm-pack/installer/init.sh -sSf | sh
 # Native tests
 cargo test
 
-# WASM modules
-cd wallet && wasm-pack build --target nodejs && cd ..
-cd mandate && wasm-pack build --target nodejs && cd ..
+# WASM modules (scoped npm packages: @arysenai/*)
+cd wallet && wasm-pack build --target nodejs --scope arysenai && cd ..
+cd mandate && wasm-pack build --target nodejs --scope arysenai && cd ..
 ```
 
 Output in `wallet/pkg/` and `mandate/pkg/`.
