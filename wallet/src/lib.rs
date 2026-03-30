@@ -21,19 +21,23 @@ extern "C" {
 }
 
 // Native stubs for `cargo test` (not compiled into WASM)
-// Uses a thread-local HashMap to simulate persistent host key store.
+// Process-wide store (Mutex) matches a single WASM host and avoids races with the global
+// `MASTER_KEY` when `cargo test` runs tests in parallel (default on macOS/Linux).
 #[cfg(not(target_arch = "wasm32"))]
 mod host_stubs {
-    use std::cell::RefCell;
     use std::collections::HashMap;
+    use std::sync::{LazyLock, Mutex};
 
-    thread_local! {
-        static HOST_STORE: RefCell<HashMap<String, Vec<u8>>> = RefCell::new(HashMap::new());
-    }
+    static HOST_STORE: LazyLock<Mutex<HashMap<String, Vec<u8>>>> =
+        LazyLock::new(|| Mutex::new(HashMap::new()));
 
     /// Clear the simulated host store (call from test reset).
+    #[cfg(test)]
     pub fn clear_host_store() {
-        HOST_STORE.with(|s| s.borrow_mut().clear());
+        HOST_STORE
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
     }
 
     #[no_mangle]
@@ -47,21 +51,19 @@ mod host_stubs {
             std::str::from_utf8(std::slice::from_raw_parts(key_id, key_id_len as usize))
                 .unwrap_or("")
         };
-        HOST_STORE.with(|s| {
-            let store = s.borrow();
-            match store.get(key_id_str) {
-                Some(data) => {
-                    if data.len() > buf_len as usize {
-                        return -2; // buffer too small
-                    }
-                    unsafe {
-                        std::ptr::copy_nonoverlapping(data.as_ptr(), buf, data.len());
-                    }
-                    data.len() as i32
+        let store = HOST_STORE.lock().unwrap_or_else(|e| e.into_inner());
+        match store.get(key_id_str) {
+            Some(data) => {
+                if data.len() > buf_len as usize {
+                    return -2; // buffer too small
                 }
-                None => -1, // not found
+                unsafe {
+                    std::ptr::copy_nonoverlapping(data.as_ptr(), buf, data.len());
+                }
+                data.len() as i32
             }
-        })
+            None => -1, // not found
+        }
     }
 
     #[no_mangle]
@@ -77,10 +79,10 @@ mod host_stubs {
         };
         let data_slice =
             unsafe { std::slice::from_raw_parts(data, data_len as usize) };
-        HOST_STORE.with(|s| {
-            s.borrow_mut()
-                .insert(key_id_str.to_string(), data_slice.to_vec());
-        });
+        HOST_STORE
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(key_id_str.to_string(), data_slice.to_vec());
         0 // success
     }
 
@@ -526,6 +528,18 @@ mod tests {
 
     // --- Key persistence tests ---
 
+    #[cfg(not(target_arch = "wasm32"))]
+    mod persistence_serial {
+        use std::sync::Mutex;
+
+        static LOCK: Mutex<()> = Mutex::new(());
+
+        /// Serialize tests that mutate the process-wide host stub map and `MASTER_KEY`.
+        pub(super) fn guard() -> std::sync::MutexGuard<'static, ()> {
+            LOCK.lock().unwrap_or_else(|e| e.into_inner())
+        }
+    }
+
     fn reset_persistence_state() {
         reset_master_key();
         host_stubs::clear_host_store();
@@ -533,6 +547,8 @@ mod tests {
 
     #[test]
     fn init_master_key_generates_and_caches() {
+        #[cfg(not(target_arch = "wasm32"))]
+        let _persist = persistence_serial::guard();
         reset_persistence_state();
         assert!(init_master_key().is_ok());
         // Master key should be cached
@@ -546,6 +562,8 @@ mod tests {
 
     #[test]
     fn init_master_key_loads_from_store_on_second_call() {
+        #[cfg(not(target_arch = "wasm32"))]
+        let _persist = persistence_serial::guard();
         reset_persistence_state();
         // First call: generate + persist
         init_master_key().unwrap();
@@ -564,6 +582,8 @@ mod tests {
 
     #[test]
     fn persist_and_load_key_roundtrip() {
+        #[cfg(not(target_arch = "wasm32"))]
+        let _persist = persistence_serial::guard();
         reset_persistence_state();
         init_master_key().unwrap();
 
@@ -582,6 +602,8 @@ mod tests {
 
     #[test]
     fn persist_key_survives_master_key_reload() {
+        #[cfg(not(target_arch = "wasm32"))]
+        let _persist = persistence_serial::guard();
         reset_persistence_state();
         init_master_key().unwrap();
 
@@ -598,6 +620,8 @@ mod tests {
 
     #[test]
     fn load_key_fails_for_nonexistent() {
+        #[cfg(not(target_arch = "wasm32"))]
+        let _persist = persistence_serial::guard();
         reset_persistence_state();
         init_master_key().unwrap();
         let result = load_key("nonexistent_key");
@@ -607,6 +631,8 @@ mod tests {
 
     #[test]
     fn persist_key_fails_without_master_key() {
+        #[cfg(not(target_arch = "wasm32"))]
+        let _persist = persistence_serial::guard();
         reset_persistence_state();
         let result = persist_key("test", b"data");
         assert!(result.is_err());
