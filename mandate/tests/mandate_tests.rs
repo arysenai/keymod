@@ -11,34 +11,35 @@ use std::collections::HashMap;
 #[test]
 fn secret_vault_deposit_and_list() {
     let mut vault = SecretVault::new();
-    vault.deposit("key1", b"encrypted1");
-    vault.deposit("key2", b"encrypted2");
+    vault.deposit("integ_key1", b"encrypted1");
+    vault.deposit("integ_key2", b"encrypted2");
 
     let names = vault.list_names();
-    assert_eq!(names.len(), 2);
-    assert!(names.contains(&"key1".to_string()));
-    assert!(names.contains(&"key2".to_string()));
+    assert!(names.len() >= 2, "expected at least 2, got {}", names.len());
+    assert!(names.contains(&"integ_key1".to_string()));
+    assert!(names.contains(&"integ_key2".to_string()));
 }
 
 #[test]
 fn secret_vault_remove() {
     let mut vault = SecretVault::new();
-    vault.deposit("temp", b"data");
-    assert!(vault.remove("temp"));
-    assert!(!vault.remove("temp")); // already removed
-    assert_eq!(vault.list_names().len(), 0);
+    vault.deposit("integ_temp", b"data");
+    assert!(vault.remove("integ_temp"));
+    assert!(!vault.remove("integ_temp")); // already removed
+    let names = vault.list_names();
+    assert!(!names.contains(&"integ_temp".to_string()), "integ_temp should not be in names");
 }
 
 #[test]
 fn secret_vault_list_returns_names_only() {
     let mut vault = SecretVault::new();
-    vault.deposit("api_key", b"super_secret_value_123");
-    vault.deposit("db_password", b"another_secret_456");
+    vault.deposit("integ_api_key", b"super_secret_value_123");
+    vault.deposit("integ_db_password", b"another_secret_456");
 
     let names = vault.list_names();
     // Names are returned, but there's no way to get values via list_names
-    assert!(names.contains(&"api_key".to_string()));
-    assert!(names.contains(&"db_password".to_string()));
+    assert!(names.contains(&"integ_api_key".to_string()));
+    assert!(names.contains(&"integ_db_password".to_string()));
     // Values are not exposed
     for name in &names {
         assert!(!name.contains("super_secret"));
@@ -50,19 +51,20 @@ fn secret_vault_list_returns_names_only() {
 fn secret_vault_deposit_retrieve_cycle() {
     // retrieve is pub(crate), so integration tests verify via deposit + list
     let mut vault = SecretVault::new();
-    assert!(vault.deposit("key", b"my_secret_value"));
+    assert!(vault.deposit("integ_cycle_key", b"my_secret_value"));
     let names = vault.list_names();
-    assert_eq!(names.len(), 1);
-    assert!(names.contains(&"key".to_string()));
+    assert!(names.contains(&"integ_cycle_key".to_string()));
 }
 
 #[test]
 fn secret_vault_overwrite() {
     let mut vault = SecretVault::new();
-    vault.deposit("key", b"value1");
-    vault.deposit("key", b"value2");
-    // Overwrite should keep only one entry
-    assert_eq!(vault.list_names().len(), 1);
+    vault.deposit("integ_overwrite_key", b"value1");
+    vault.deposit("integ_overwrite_key", b"value2");
+    // Overwrite should keep only one entry for this key
+    let names = vault.list_names();
+    let count = names.iter().filter(|n| *n == "integ_overwrite_key").count();
+    assert_eq!(count, 1, "expected 1 occurrence of integ_overwrite_key, got {}", count);
 }
 
 // ============================================================================

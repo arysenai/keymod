@@ -116,7 +116,7 @@ fn load_private_key(key_id: &str) -> Option<Vec<u8>> {
 static MASTER_KEY: Mutex<Option<[u8; 32]>> = Mutex::new(None);
 
 /// Call the host key_store_read import. Returns the stored bytes or None.
-pub(crate) fn host_key_store_read(key_id: &str) -> Option<Vec<u8>> {
+pub fn host_key_store_read(key_id: &str) -> Option<Vec<u8>> {
     let mut buf = vec![0u8; 4096]; // 4KB should be enough for any encrypted key blob
     let result = unsafe {
         call_key_store_read(
@@ -134,7 +134,7 @@ pub(crate) fn host_key_store_read(key_id: &str) -> Option<Vec<u8>> {
 }
 
 /// Call the host key_store_write import.
-pub(crate) fn host_key_store_write(key_id: &str, data: &[u8]) -> Result<(), String> {
+pub fn host_key_store_write(key_id: &str, data: &[u8]) -> Result<(), String> {
     let result = unsafe {
         call_key_store_write(
             key_id.as_ptr(),
