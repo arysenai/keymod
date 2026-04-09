@@ -1,6 +1,6 @@
 [package]
-name = "arysen-wallet"
-version = "0.3.1"
+name = "arysen-storage"
+version = "0.1.0"
 edition = "2021"
 
 [lib]
@@ -10,15 +10,12 @@ crate-type = ["cdylib", "rlib"]
 wasm-bindgen = "0.2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-getrandom = { version = "0.2", features = ["js"] }
-hex = "0.4"
 serde-wasm-bindgen = "0.6"
-ed25519-dalek = { version = "2", features = ["rand_core"] }
-k256 = { version = "0.13", features = ["ecdsa"] }
 aes-gcm = "0.10"
 sha2 = "0.10"
-sha3 = "0.10"
-rand_core = { version = "0.6", features = ["getrandom"] }
+hex = "0.4"
+getrandom = { version = "0.2", features = ["js"] }
 x25519-dalek = { version = "2", features = ["static_secrets"] }
-hmac = "0.12"
 hkdf = "0.12"
+cid = { version = "0.11", default-features = false, features = ["alloc"] }
+multihash-codetable = { version = "0.1", default-features = false, features = ["sha2"] }
