@@ -391,6 +391,76 @@ pub fn get_encryption_pubkey(key_id: &str) -> String {
     derive_encryption_pubkey(key_id, 0)
 }
 
+/// Wrap (encrypt) an X25519 private key for secure transfer to the storage WASM module.
+///
+/// Protocol: ephemeral ECDH + HKDF("arysen-key-wrap-v1") + AES-256-GCM.
+/// The storage module's session public key is the recipient.
+///
+/// Output hex encodes: ephemeral_pubkey(32) | nonce(12) | ciphertext(32) | tag(16) = 92 bytes.
+/// Returns empty string on error (missing key, bad target pubkey).
+#[wasm_bindgen]
+pub fn wrap_decryption_key(
+    func_key_id: &str,
+    rotation_index: u32,
+    target_pubkey_hex: &str,
+) -> String {
+    use aes_gcm::aead::{Aead, KeyInit};
+    use aes_gcm::{Aes256Gcm, Nonce};
+    use hkdf::Hkdf;
+    use sha2::Sha256;
+    use x25519_dalek::{PublicKey, StaticSecret};
+
+    const WRAP_INFO: &[u8] = b"arysen-key-wrap-v1";
+
+    // 1. Load BIP-32 seed and derive the X25519 private key
+    let store_key = format!("func_seed:{}", func_key_id);
+    let Some(seed_bytes) = load_private_key(&store_key) else {
+        return String::new();
+    };
+    let Ok(seed) = <[u8; 32]>::try_from(seed_bytes.as_slice()) else {
+        return String::new();
+    };
+    let (file_secret, _) = x25519::derive_x25519_keypair(&seed, rotation_index);
+    let secret_bytes: [u8; 32] = file_secret.to_bytes();
+
+    // 2. Parse the target (storage session) public key
+    let target_bytes = match hex::decode(target_pubkey_hex) {
+        Ok(b) if b.len() == 32 => {
+            let mut arr = [0u8; 32];
+            arr.copy_from_slice(&b);
+            arr
+        }
+        _ => return String::new(),
+    };
+
+    // 3. Ephemeral ECDH → shared secret → HKDF → wrapping key
+    let mut eph_bytes = [0u8; 32];
+    getrandom::getrandom(&mut eph_bytes).expect("getrandom failed");
+    let eph_secret = StaticSecret::from(eph_bytes);
+    let eph_public = PublicKey::from(&eph_secret);
+
+    let target_pub = PublicKey::from(target_bytes);
+    let shared = eph_secret.diffie_hellman(&target_pub);
+
+    let hk = Hkdf::<Sha256>::new(None, shared.as_bytes());
+    let mut wrapping_key = [0u8; 32];
+    hk.expand(WRAP_INFO, &mut wrapping_key).expect("valid HKDF length");
+
+    // 4. AES-256-GCM encrypt the X25519 private key
+    let mut nonce_bytes = [0u8; 12];
+    getrandom::getrandom(&mut nonce_bytes).expect("getrandom failed");
+    let cipher = Aes256Gcm::new_from_slice(&wrapping_key).expect("valid key");
+    let nonce = Nonce::from_slice(&nonce_bytes);
+    let ciphertext = cipher.encrypt(nonce, secret_bytes.as_ref()).expect("encryption failed");
+
+    // 5. Assemble: ephemeral_pub(32) | nonce(12) | ciphertext+tag(48)
+    let mut out = Vec::with_capacity(32 + 12 + ciphertext.len());
+    out.extend_from_slice(eph_public.as_bytes());
+    out.extend_from_slice(&nonce_bytes);
+    out.extend_from_slice(&ciphertext);
+    hex::encode(out)
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -774,6 +844,113 @@ mod tests {
         let (_, pub2) = x25519::derive_x25519_keypair(&loaded_seed, 0);
 
         assert_eq!(pub1.as_bytes(), pub2.as_bytes(), "pubkey must survive persistence roundtrip");
+    }
+
+    // --- Key wrapping (inter-module sealed box) ---
+
+    #[test]
+    fn wrap_decryption_key_roundtrip() {
+        use aes_gcm::aead::{Aead, KeyInit};
+        use aes_gcm::{Aes256Gcm, Nonce as AesNonce};
+        use hkdf::Hkdf;
+        use sha2::Sha256;
+        use x25519_dalek::{PublicKey, StaticSecret};
+
+        // Generate a functionality key (stores BIP-32 seed in key store)
+        let (_, func_key_id) = generate_functionality_internal();
+        let expected_pubkey_hex = derive_encryption_pubkey(&func_key_id, 0);
+        assert_eq!(expected_pubkey_hex.len(), 64);
+
+        // Simulate the storage module's session keypair
+        let mut target_secret_bytes = [0u8; 32];
+        getrandom::getrandom(&mut target_secret_bytes).unwrap();
+        let target_secret = StaticSecret::from(target_secret_bytes);
+        let target_public = PublicKey::from(&target_secret);
+        let target_pubkey_hex = hex::encode(target_public.as_bytes());
+
+        // Wrap the decryption key
+        let wrapped_hex = wrap_decryption_key(&func_key_id, 0, &target_pubkey_hex);
+        assert!(!wrapped_hex.is_empty(), "wrap should succeed");
+
+        // Verify output size: (32 + 12 + 32 + 16) * 2 = 184 hex chars
+        assert_eq!(wrapped_hex.len(), 184, "wrapped blob should be 92 bytes = 184 hex chars");
+
+        // Unwrap (simulating storage module's protocol)
+        let blob = hex::decode(&wrapped_hex).unwrap();
+        let eph_pub_bytes: [u8; 32] = blob[..32].try_into().unwrap();
+        let nonce_bytes: [u8; 12] = blob[32..44].try_into().unwrap();
+        let ciphertext = &blob[44..];
+
+        let eph_pub = PublicKey::from(eph_pub_bytes);
+        let shared = target_secret.diffie_hellman(&eph_pub);
+
+        let hk = Hkdf::<Sha256>::new(None, shared.as_bytes());
+        let mut wrapping_key = [0u8; 32];
+        hk.expand(b"arysen-key-wrap-v1", &mut wrapping_key).unwrap();
+
+        let cipher = Aes256Gcm::new_from_slice(&wrapping_key).unwrap();
+        let nonce = AesNonce::from_slice(&nonce_bytes);
+        let plaintext = cipher.decrypt(nonce, ciphertext).unwrap();
+
+        // The unwrapped key should be the X25519 private key
+        assert_eq!(plaintext.len(), 32);
+
+        // Verify: derive pubkey from unwrapped secret, should match the original
+        let recovered_secret = StaticSecret::from(<[u8; 32]>::try_from(plaintext.as_slice()).unwrap());
+        let recovered_public = PublicKey::from(&recovered_secret);
+        assert_eq!(
+            hex::encode(recovered_public.as_bytes()),
+            expected_pubkey_hex,
+            "unwrapped key must produce the same public key"
+        );
+    }
+
+    #[test]
+    fn wrap_decryption_key_wrong_target_fails_unwrap() {
+        use aes_gcm::aead::{Aead, KeyInit};
+        use aes_gcm::{Aes256Gcm, Nonce as AesNonce};
+        use hkdf::Hkdf;
+        use sha2::Sha256;
+        use x25519_dalek::{PublicKey, StaticSecret};
+
+        let (_, func_key_id) = generate_functionality_internal();
+
+        // Wrap with target A
+        let mut target_a_bytes = [0u8; 32];
+        getrandom::getrandom(&mut target_a_bytes).unwrap();
+        let target_a_pub = PublicKey::from(&StaticSecret::from(target_a_bytes));
+        let wrapped = wrap_decryption_key(&func_key_id, 0, &hex::encode(target_a_pub.as_bytes()));
+        assert!(!wrapped.is_empty());
+
+        // Try to unwrap with target B (different key) — should fail AES-GCM auth
+        let mut target_b_bytes = [0u8; 32];
+        getrandom::getrandom(&mut target_b_bytes).unwrap();
+        let target_b_secret = StaticSecret::from(target_b_bytes);
+
+        let blob = hex::decode(&wrapped).unwrap();
+        let eph_pub = PublicKey::from(<[u8; 32]>::try_from(&blob[..32]).unwrap());
+        let nonce_bytes: [u8; 12] = blob[32..44].try_into().unwrap();
+        let ciphertext = &blob[44..];
+
+        let shared = target_b_secret.diffie_hellman(&eph_pub);
+        let hk = Hkdf::<Sha256>::new(None, shared.as_bytes());
+        let mut wrapping_key = [0u8; 32];
+        hk.expand(b"arysen-key-wrap-v1", &mut wrapping_key).unwrap();
+
+        let cipher = Aes256Gcm::new_from_slice(&wrapping_key).unwrap();
+        let nonce = AesNonce::from_slice(&nonce_bytes);
+        let result = cipher.decrypt(nonce, ciphertext);
+        assert!(result.is_err(), "unwrap with wrong key must fail");
+    }
+
+    #[test]
+    fn wrap_decryption_key_bad_inputs() {
+        let (_, func_key_id) = generate_functionality_internal();
+        // Bad target pubkey
+        assert_eq!(wrap_decryption_key(&func_key_id, 0, "tooshort"), "");
+        assert_eq!(wrap_decryption_key(&func_key_id, 0, "zz"), "");
+        // Missing functionality key
+        assert_eq!(wrap_decryption_key("nonexistent", 0, &"aa".repeat(32)), "");
     }
 
 }

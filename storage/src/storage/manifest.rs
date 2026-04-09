@@ -3,7 +3,6 @@
 /// Serialized as JSON for now. DAG-PB encoding can be added later
 /// for full IPFS compatibility without changing the API.
 
-use cid::Cid;
 use serde::{Deserialize, Serialize};
 
 /// Manifest describing an encrypted file upload.
